@@ -20,6 +20,7 @@ use crate::config::validate_schema_name;
 use crate::error::{RemembrallError, Result};
 use crate::graph::GraphStore;
 use crate::graph::types::{Relationship, Symbol};
+use crate::schema::{self, DdlStep, Requirement, SchemaReport};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -136,25 +137,37 @@ impl Indexer {
 
     /// Ensure the `file_index` tracking table exists.
     pub async fn init(&self) -> Result<()> {
-        self.graph.init().await?;
+        self.init_with_report().await.map(|_| ())
+    }
 
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {schema}.file_index (
-                file_path  TEXT        NOT NULL,
-                project    TEXT        NOT NULL,
-                mtime      TIMESTAMPTZ NOT NULL,
-                indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (file_path, project)
+    /// Ensure the graph tables and `file_index` exist, reporting which startup
+    /// DDL steps ran (see [`crate::schema`]).
+    pub async fn init_with_report(&self) -> Result<SchemaReport> {
+        let mut report = self.graph.init_with_report().await?;
+
+        let steps = vec![
+            DdlStep::new(
+                "file_index table",
+                vec![Requirement::Relation("file_index")],
+                format!(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS {schema}.file_index (
+                        file_path  TEXT        NOT NULL,
+                        project    TEXT        NOT NULL,
+                        mtime      TIMESTAMPTZ NOT NULL,
+                        indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (file_path, project)
+                    )
+                    "#,
+                    schema = self.schema,
+                ),
             )
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
+            .after(vec![Requirement::Schema]),
+        ];
+        report.extend(schema::ensure_all(&self.pool, &self.schema, &steps).await?);
 
         info!("Indexer initialized (schema='{}')", self.schema);
-        Ok(())
+        Ok(report)
     }
 
     /// Parse a complete configured snapshot under the project writer lock.

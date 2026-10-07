@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::config::validate_schema_name;
 use crate::error::{RemembrallError, Result};
+use crate::schema::{self, DdlStep, Requirement, SchemaReport};
 use super::types::*;
 
 /// Core memory storage engine backed by Postgres + pgvector.
@@ -24,108 +25,146 @@ impl MemoryStore {
 
     /// Initialize database schema (tables, indexes, extensions).
     pub async fn init(&self) -> Result<()> {
-        // Enable pgvector extension
-        sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
-            .execute(&self.pool)
-            .await?;
+        self.init_with_report().await.map(|_| ())
+    }
 
-        // Create schema
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema))
-            .execute(&self.pool)
-            .await?;
+    /// Initialize the memory schema and report which startup DDL steps ran.
+    ///
+    /// Each step is skipped when the catalog already satisfies it, so a current
+    /// schema requests no table lock. A step that must run waits at most
+    /// [`crate::schema::DDL_LOCK_TIMEOUT`] for its lock and is otherwise deferred
+    /// with a warning (see [`crate::schema`]).
+    pub async fn init_with_report(&self) -> Result<SchemaReport> {
+        use Requirement::Relation;
 
-        // Memory entries table
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {schema}.memories (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                content TEXT NOT NULL,
-                summary TEXT,
-                memory_type TEXT NOT NULL,
-                source_system TEXT NOT NULL,
-                source_identifier TEXT NOT NULL,
-                source_author TEXT,
-                scope_organization TEXT,
-                scope_team TEXT,
-                scope_project TEXT,
-                tags TEXT[] DEFAULT '{{}}',
-                metadata JSONB DEFAULT '{{}}',
-                importance REAL DEFAULT 0.5,
-                access_count INTEGER DEFAULT 0,
-                content_fingerprint TEXT NOT NULL,
-                embedding vector(384),
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW(),
-                last_accessed_at TIMESTAMPTZ,
-                expires_at TIMESTAMPTZ
+        let steps = vec![
+            // Enable pgvector extension
+            DdlStep::new(
+                "vector extension",
+                vec![Requirement::Extension("vector")],
+                "CREATE EXTENSION IF NOT EXISTS vector".to_string(),
+            ),
+            // Create schema
+            DdlStep::new(
+                "schema",
+                vec![Requirement::Schema],
+                format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema),
+            ),
+            // Memory entries table
+            DdlStep::new(
+                "memories table",
+                vec![Relation("memories")],
+                format!(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS {schema}.memories (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        content TEXT NOT NULL,
+                        summary TEXT,
+                        memory_type TEXT NOT NULL,
+                        source_system TEXT NOT NULL,
+                        source_identifier TEXT NOT NULL,
+                        source_author TEXT,
+                        scope_organization TEXT,
+                        scope_team TEXT,
+                        scope_project TEXT,
+                        tags TEXT[] DEFAULT '{{}}',
+                        metadata JSONB DEFAULT '{{}}',
+                        importance REAL DEFAULT 0.5,
+                        access_count INTEGER DEFAULT 0,
+                        content_fingerprint TEXT NOT NULL,
+                        embedding vector(384),
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        last_accessed_at TIMESTAMPTZ,
+                        expires_at TIMESTAMPTZ
+                    )
+                    "#,
+                    schema = self.schema,
+                ),
             )
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
+            .after(vec![Requirement::Schema, Requirement::Extension("vector")]),
+            // Indexes
+            DdlStep::new(
+                "idx_memories_type",
+                vec![Relation("idx_memories_type")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_memories_type ON {schema}.memories (memory_type);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("memories")])
+            .locking("memories"),
+            DdlStep::new(
+                "idx_memories_scope",
+                vec![Relation("idx_memories_scope")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_memories_scope ON {schema}.memories (scope_organization, scope_team, scope_project);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("memories")])
+            .locking("memories"),
+            DdlStep::new(
+                "idx_memories_tags",
+                vec![Relation("idx_memories_tags")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_memories_tags ON {schema}.memories USING GIN (tags);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("memories")])
+            .locking("memories"),
+            DdlStep::new(
+                "idx_memories_fingerprint",
+                vec![Relation("idx_memories_fingerprint")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON {schema}.memories (content_fingerprint);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("memories")])
+            .locking("memories"),
+            // HNSW index for fast vector similarity search
+            DdlStep::new(
+                "idx_memories_embedding",
+                vec![Relation("idx_memories_embedding")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_memories_embedding ON {schema}.memories
+                    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("memories")])
+            .locking("memories"),
+            // Full-text search index
+            DdlStep::new(
+                "idx_memories_fts",
+                vec![Relation("idx_memories_fts")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_memories_fts ON {schema}.memories
+                    USING GIN (to_tsvector('english', coalesce(content, '') || ' ' || coalesce(summary, '')));
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("memories")])
+            .locking("memories"),
+        ];
 
-        // Indexes
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_memories_type ON {schema}.memories (memory_type);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_memories_scope ON {schema}.memories (scope_organization, scope_team, scope_project);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_memories_tags ON {schema}.memories USING GIN (tags);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON {schema}.memories (content_fingerprint);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        // HNSW index for fast vector similarity search
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_memories_embedding ON {schema}.memories
-            USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        // Full-text search index
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_memories_fts ON {schema}.memories
-            USING GIN (to_tsvector('english', coalesce(content, '') || ' ' || coalesce(summary, '')));
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
+        let report = schema::ensure_all(&self.pool, &self.schema, &steps).await?;
         tracing::info!("Memory store initialized in schema '{}'", self.schema);
-        Ok(())
+        Ok(report)
     }
 
     /// Store a new memory. Returns the ID.

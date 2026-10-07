@@ -5,6 +5,7 @@ pub mod memory;
 pub mod graph;
 pub mod indexer;
 pub mod parser;
+pub mod schema;
 pub mod search;
 pub mod ingest;
 

@@ -108,6 +108,30 @@ async fn cmd_serve() -> Result<()> {
     Ok(())
 }
 
+/// Create or verify the schema for an admin command (`init`, `reset`). Unlike
+/// server startup, which keeps serving and retries deferred steps on its next
+/// start, an admin command refuses to report success while a step was deferred
+/// because its table was busy.
+async fn ensure_schema(pool: &sqlx::PgPool, schema: &str) -> Result<()> {
+    let mut report =
+        remembrall_core::memory::store::MemoryStore::new(pool.clone(), schema.to_string())?
+            .init_with_report()
+            .await?;
+    report.extend(
+        remembrall_core::graph::store::GraphStore::new(pool.clone(), schema.to_string())?
+            .init_with_report()
+            .await?,
+    );
+    if !report.deferred.is_empty() {
+        anyhow::bail!(
+            "schema incomplete: these steps timed out waiting for a busy table: {}. \
+             Re-run once no long transaction holds the remembrall tables.",
+            report.deferred.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Initialize RemembrallMCP - set up database, schema, and embedding model.
 async fn cmd_init(database_url: Option<String>, port: u16) -> Result<()> {
     println!("Setting up RemembrallMCP...\n");
@@ -131,16 +155,7 @@ async fn cmd_init(database_url: Option<String>, port: u16) -> Result<()> {
             .await?;
 
         println!("Creating schema...");
-        let memory_store = remembrall_core::memory::store::MemoryStore::new(
-            pool.clone(),
-            config.database.schema.clone(),
-        )?;
-        memory_store.init().await?;
-        let graph_store = remembrall_core::graph::store::GraphStore::new(
-            pool.clone(),
-            config.database.schema.clone(),
-        )?;
-        graph_store.init().await?;
+        ensure_schema(&pool, &config.database.schema).await?;
 
         println!("Database ready.\n");
     } else {
@@ -264,16 +279,7 @@ async fn cmd_init(database_url: Option<String>, port: u16) -> Result<()> {
             .execute(&pool)
             .await?;
 
-        let memory_store = remembrall_core::memory::store::MemoryStore::new(
-            pool.clone(),
-            config.database.schema.clone(),
-        )?;
-        memory_store.init().await?;
-        let graph_store = remembrall_core::graph::store::GraphStore::new(
-            pool.clone(),
-            config.database.schema.clone(),
-        )?;
-        graph_store.init().await?;
+        ensure_schema(&pool, &config.database.schema).await?;
 
         println!("Database ready.\n");
     }
@@ -570,16 +576,7 @@ async fn cmd_reset(force: bool) -> Result<()> {
     .execute(&pool)
     .await?;
 
-    let memory_store = remembrall_core::memory::store::MemoryStore::new(
-        pool.clone(),
-        config.database.schema.clone(),
-    )?;
-    memory_store.init().await?;
-    let graph_store = remembrall_core::graph::store::GraphStore::new(
-        pool.clone(),
-        config.database.schema.clone(),
-    )?;
-    graph_store.init().await?;
+    ensure_schema(&pool, &config.database.schema).await?;
 
     println!("All data reset. Schema recreated.");
     Ok(())

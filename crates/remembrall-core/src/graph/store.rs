@@ -5,6 +5,7 @@ use uuid::Uuid;
 use super::types::*;
 use crate::config::validate_schema_name;
 use crate::error::{RemembrallError, Result};
+use crate::schema::{self, DdlStep, Requirement, SchemaReport};
 
 /// Code graph storage backed by Postgres adjacency tables + recursive CTEs.
 pub struct GraphStore {
@@ -43,111 +44,158 @@ impl GraphStore {
 
     /// Initialize graph tables.
     pub async fn init(&self) -> Result<()> {
-        // Ensure schema exists
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema))
-            .execute(&self.pool)
-            .await?;
+        self.init_with_report().await.map(|_| ())
+    }
 
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {schema}.symbols (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                name TEXT NOT NULL,
-                symbol_type TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                start_line INTEGER,
-                end_line INTEGER,
-                language TEXT NOT NULL,
-                project TEXT NOT NULL,
-                signature TEXT,
-                file_mtime TIMESTAMPTZ NOT NULL,
-                layer TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+    /// Initialize graph tables and report which startup DDL steps ran.
+    ///
+    /// Each step is skipped when the catalog already satisfies it, so a current
+    /// schema requests no table lock. A step that must run waits at most
+    /// [`crate::schema::DDL_LOCK_TIMEOUT`] for its lock and is otherwise deferred
+    /// with a warning (see [`crate::schema`]).
+    pub async fn init_with_report(&self) -> Result<SchemaReport> {
+        use Requirement::{Column, Relation};
+
+        let steps = vec![
+            DdlStep::new(
+                "schema",
+                vec![Requirement::Schema],
+                format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema),
+            ),
+            DdlStep::new(
+                "symbols table",
+                vec![Relation("symbols")],
+                format!(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS {schema}.symbols (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        name TEXT NOT NULL,
+                        symbol_type TEXT NOT NULL,
+                        file_path TEXT NOT NULL,
+                        start_line INTEGER,
+                        end_line INTEGER,
+                        language TEXT NOT NULL,
+                        project TEXT NOT NULL,
+                        signature TEXT,
+                        file_mtime TIMESTAMPTZ NOT NULL,
+                        layer TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    "#,
+                    schema = self.schema,
+                ),
             )
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        // Add field-tracking columns to existing installs (no migration framework;
-        // CREATE TABLE IF NOT EXISTS above does not add columns to an existing table, so
-        // these idempotent ALTERs self-migrate on every boot without data loss).
-        sqlx::query(&format!(
-            r#"
-            ALTER TABLE {schema}.symbols
-                ADD COLUMN IF NOT EXISTS parent_symbol_id UUID,
-                ADD COLUMN IF NOT EXISTS moniker TEXT
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {schema}.relationships (
-                source_id UUID NOT NULL REFERENCES {schema}.symbols(id) ON DELETE CASCADE,
-                target_id UUID NOT NULL REFERENCES {schema}.symbols(id) ON DELETE CASCADE,
-                rel_type TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 1.0,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (source_id, target_id, rel_type)
+            .after(vec![Requirement::Schema]),
+            // Add field-tracking columns to existing installs (no migration framework;
+            // CREATE TABLE IF NOT EXISTS above does not add columns to an existing table).
+            // ADD COLUMN IF NOT EXISTS still takes ACCESS EXCLUSIVE on symbols, so it
+            // only runs when a column is actually missing.
+            DdlStep::new(
+                "symbols field-tracking columns",
+                vec![
+                    Column { table: "symbols", column: "parent_symbol_id" },
+                    Column { table: "symbols", column: "moniker" },
+                ],
+                format!(
+                    r#"
+                    ALTER TABLE {schema}.symbols
+                        ADD COLUMN IF NOT EXISTS parent_symbol_id UUID,
+                        ADD COLUMN IF NOT EXISTS moniker TEXT
+                    "#,
+                    schema = self.schema,
+                ),
             )
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
+            .after(vec![Relation("symbols")])
+            .locking("symbols"),
+            // The foreign keys lock the referenced symbols table.
+            DdlStep::new(
+                "relationships table",
+                vec![Relation("relationships")],
+                format!(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS {schema}.relationships (
+                        source_id UUID NOT NULL REFERENCES {schema}.symbols(id) ON DELETE CASCADE,
+                        target_id UUID NOT NULL REFERENCES {schema}.symbols(id) ON DELETE CASCADE,
+                        rel_type TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 1.0,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (source_id, target_id, rel_type)
+                    )
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("symbols")])
+            .locking("symbols"),
+            // Indexes for fast traversal
+            DdlStep::new(
+                "idx_symbols_file",
+                vec![Relation("idx_symbols_file")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_symbols_file ON {schema}.symbols (file_path);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("symbols")])
+            .locking("symbols"),
+            DdlStep::new(
+                "idx_symbols_name",
+                vec![Relation("idx_symbols_name")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_symbols_name ON {schema}.symbols (name, symbol_type);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("symbols")])
+            .locking("symbols"),
+            DdlStep::new(
+                "idx_symbols_parent",
+                vec![Relation("idx_symbols_parent")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_symbols_parent ON {schema}.symbols (parent_symbol_id);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![
+                Relation("symbols"),
+                Column { table: "symbols", column: "parent_symbol_id" },
+            ])
+            .locking("symbols"),
+            DdlStep::new(
+                "idx_relationships_source",
+                vec![Relation("idx_relationships_source")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_relationships_source ON {schema}.relationships (source_id);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("relationships")])
+            .locking("relationships"),
+            DdlStep::new(
+                "idx_relationships_target",
+                vec![Relation("idx_relationships_target")],
+                format!(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_relationships_target ON {schema}.relationships (target_id);
+                    "#,
+                    schema = self.schema,
+                ),
+            )
+            .after(vec![Relation("relationships")])
+            .locking("relationships"),
+        ];
 
-        // Indexes for fast traversal
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_symbols_file ON {schema}.symbols (file_path);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_symbols_name ON {schema}.symbols (name, symbol_type);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_symbols_parent ON {schema}.symbols (parent_symbol_id);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_relationships_source ON {schema}.relationships (source_id);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_relationships_target ON {schema}.relationships (target_id);
-            "#,
-            schema = self.schema,
-        ))
-        .execute(&self.pool)
-        .await?;
-
+        let report = schema::ensure_all(&self.pool, &self.schema, &steps).await?;
         tracing::info!("Graph store initialized in schema '{}'", self.schema);
-        Ok(())
+        Ok(report)
     }
 
     /// Insert or update a symbol. Returns the ID.
