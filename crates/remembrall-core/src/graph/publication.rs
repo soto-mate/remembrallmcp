@@ -13,6 +13,9 @@ pub struct IndexPublication {
     pub files_skipped: usize,
     pub symbols_stored: usize,
     pub relationships_stored: usize,
+    /// Files skipped because the grammar rejected them; their symbols are absent
+    /// from this publication until they parse again.
+    pub files_with_parse_errors: Vec<String>,
 }
 
 /// Refresh a complete project. Watcher refreshes deliberately use this same path:
@@ -32,6 +35,13 @@ pub async fn refresh_project(
         .map_err(|e| {
             RemembrallError::Internal(format!("index failed; previous graph preserved: {e}"))
         })?;
+    if !snapshot.files_with_parse_errors.is_empty() {
+        tracing::warn!(
+            "{} file(s) skipped for parse errors; first: {}",
+            snapshot.files_with_parse_errors.len(),
+            snapshot.files_with_parse_errors[0]
+        );
+    }
     let counts = update
         .replace(&snapshot.symbols, &snapshot.relationships)
         .await?;
@@ -40,5 +50,6 @@ pub async fn refresh_project(
         files_skipped: snapshot.files_skipped,
         symbols_stored: counts.symbols,
         relationships_stored: counts.relationships,
+        files_with_parse_errors: snapshot.files_with_parse_errors,
     })
 }

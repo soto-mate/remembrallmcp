@@ -37,6 +37,9 @@ pub struct IndexResult {
     pub files_parsed: usize,
     /// Number of files skipped (unchanged since `since`).
     pub files_skipped: usize,
+    /// Files the grammar rejected during a strict scan. They contribute no
+    /// symbols and are listed here instead of refusing the whole publication.
+    pub files_with_parse_errors: Vec<String>,
 }
 
 /// Walk `root_dir` and index all supported source files.
@@ -129,7 +132,13 @@ fn index_directory_impl(root_dir: &Path, project: &str, since: Option<DateTime<U
             }
         };
 
-        anyhow::ensure!(!strict || !file_result.had_errors, "parse errors in {}", path.display());
+        if strict && file_result.had_errors {
+            // A grammar gap is not corruption: the file is skipped and listed,
+            // while unreadable files and walk errors still refuse publication.
+            tracing::warn!("parse errors in {}; file skipped from the published graph", path.display());
+            result.files_with_parse_errors.push(file_path.clone());
+            continue;
+        }
         result.files_parsed += 1;
         file_results.push(file_result);
     }
@@ -672,6 +681,8 @@ fn should_skip(path: &Path) -> bool {
             | "target"
             | "dist"
             | "build"
+            | "scratchpad"
+            | "plans"
             | ".git"
             | "vendor"
             | "venv"

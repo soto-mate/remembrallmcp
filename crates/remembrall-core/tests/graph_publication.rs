@@ -167,7 +167,7 @@ async fn projects_do_not_block_each_other_and_dropped_lease_releases() {
 }
 
 #[tokio::test]
-async fn watcher_refresh_rebuilds_inbound_links_and_preserves_graph_on_parse_failure() {
+async fn watcher_refresh_rebuilds_inbound_links_and_skips_a_file_that_fails_to_parse() {
     let (pool, store, schema) = fixture().await;
     let root = std::env::temp_dir().join(format!("graph-refresh-{}", Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
@@ -206,9 +206,22 @@ async fn watcher_refresh_rebuilds_inbound_links_and_preserves_graph_on_parse_fai
         "export function target( { broken syntax !!!",
     )
     .unwrap();
-    let error = refresh_project(&store, &root, "watched").await.unwrap_err();
-    assert!(error.to_string().contains("target.ts"));
-    assert_eq!(ids(&pool, &schema, "watched").await, good_ids);
+    // A grammar gap no longer refuses publication: the broken file is skipped and
+    // listed, the rest of the project is republished, and its edges go with it.
+    let skipped = refresh_project(&store, &root, "watched").await.unwrap();
+    assert_eq!(skipped.files_with_parse_errors.len(), 1);
+    assert!(skipped.files_with_parse_errors[0].ends_with("target.ts"));
+    let broken: i64 = sqlx::query_scalar(&query).fetch_one(&pool).await.unwrap();
+    assert_eq!(broken, 0, "a file that fails to parse contributes no symbols");
+    std::fs::write(
+        root.join("target.ts"),
+        "export function target() { return 3; }\n",
+    )
+    .unwrap();
+    let repaired = refresh_project(&store, &root, "watched").await.unwrap();
+    assert!(repaired.files_with_parse_errors.is_empty());
+    let restored: i64 = sqlx::query_scalar(&query).fetch_one(&pool).await.unwrap();
+    assert_eq!(restored, 1, "the edge returns once the file parses again");
     std::fs::remove_file(root.join("target.ts")).unwrap();
     refresh_project(&store, &root, "watched").await.unwrap();
     let remaining: i64 = sqlx::query_scalar(&query).fetch_one(&pool).await.unwrap();

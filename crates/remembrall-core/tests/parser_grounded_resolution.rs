@@ -284,13 +284,14 @@ fn rust_import_alias_calls_and_types_have_module_evidence() {
 }
 
 #[test]
-fn strict_scan_refuses_malformed_or_unreadable_source_but_permissive_api_remains() {
+fn strict_scan_skips_malformed_but_refuses_unreadable_source() {
     let f = Fixture::new();
     f.write("bad.ts", "function broken( {");
-    assert!(index_directory_strict(&f.0, "fixture")
-        .unwrap_err()
-        .to_string()
-        .contains("bad.ts"));
+    // A grammar gap is skipped and listed rather than refusing publication.
+    let strict = index_directory_strict(&f.0, "fixture").unwrap();
+    assert_eq!(strict.files_parsed, 0);
+    assert_eq!(strict.files_with_parse_errors.len(), 1);
+    assert!(strict.files_with_parse_errors[0].ends_with("bad.ts"));
     assert_eq!(
         index_directory(&f.0, "fixture", None).unwrap().files_parsed,
         1
@@ -302,6 +303,19 @@ fn strict_scan_refuses_malformed_or_unreadable_source_but_permissive_api_remains
         0
     );
     assert!(index_directory_strict(f.0.join("absent"), "fixture").is_err());
+}
+
+#[test]
+fn scratchpad_and_plans_trees_are_not_indexed() {
+    let f = Fixture::new();
+    f.write("kept.ts", "export function kept() {}");
+    for dir in ["scratchpad", "plans"] {
+        fs::create_dir_all(f.0.join(dir)).unwrap();
+        f.write(&format!("{dir}/copy.ts"), "export function copy() {}");
+    }
+    let r = f.index();
+    assert_eq!(r.files_parsed, 1);
+    assert!(r.symbols.iter().all(|s| !s.file_path.contains("/scratchpad/") && !s.file_path.contains("/plans/")));
 }
 
 #[test]
